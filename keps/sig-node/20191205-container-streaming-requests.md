@@ -102,8 +102,8 @@ To summarize, here is a table describing the interaction of `redirect-container-
 
 |                                            | `StreamingProxyRedirects=true`                                                            | `StreamingProxyRedirects=false`                                                                |
 |:-------------------------------------------|:------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------|
-| **`--redirect-container-streaming=false`** | _Default configuration_<br>Kubelet proxies locally<br>(see [Proposal](#proposal) diagram) | Kubelet proxies locally                                                                        |
-| **`--redirect-container-streaming=true`**  | Kubelet responds with a 302 redirect, apiserver follows the redirect.                     | Kubelet responds with a 302 redirect, apiserver proxies redirect to the client, request fails. |
+| **`--redirect-container-streaming=false`** | _Default configuration_<br>Kubelet proxies locally<br>(see [Proposal](#proposal) diagram) | _Proposed final state_<br>Kubelet proxies locally                                                                        |
+| **`--redirect-container-streaming=true`**  | _Default prior to v1.11_<br>Kubelet responds with a 302 redirect, apiserver follows the redirect.                     | Kubelet responds with a 302 redirect, apiserver proxies redirect to the client, request fails. |
 
 ## Motivation
 
