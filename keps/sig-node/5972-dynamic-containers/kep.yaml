@@ -7,6 +7,7 @@ participating-sigs: []
 status: implementable
 creation-date: 2026-06-07
 reviewers:
+  - "@derekwaynecarr"
   - "@haircommander"
 approvers:
   - "@dchen1107"

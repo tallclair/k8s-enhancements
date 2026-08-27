@@ -55,6 +55,7 @@
     - [Ephemeral Containers](#ephemeral-containers)
   - [Alternative design details](#alternative-design-details)
     - [No SecurityContext escalations](#no-securitycontext-escalations)
+    - [Mutable opt-in field](#mutable-opt-in-field)
 <!-- /toc -->
 
 ## Release Signoff Checklist
@@ -236,6 +237,9 @@ rules apply.
 
 Future extensions that enable additional pod dynamism and mutability (such as dynamic volume
 provisioning) will be added to this same subresource.
+
+The `dynamic` subresource (and others) can be disabled by a statically configured API server option,
+`--disable-pod-subresources`.
 
 #### Limitations
 
@@ -648,3 +652,21 @@ the pod. More specifically:
 - `RunAsNonRoot`, `ReadOnlyRootFilestystem`: Must be set if ALL containers set these.
 - `AllowPrivilegeEscalation`: Must be set to `false` if ALL containers explicitly disable (the implicit default is `true`).
 - `ProcMount`: Can only be set to `Unmasked` if another container already has an unmasked proc mount.
+
+#### Mutable opt-in field
+
+There have been several calls for a dedicated field to opt-in pods to dynamic mutability, but there
+are several issues with this approach.
+
+1. **Backwards compatibility**: a `mutable` field implies that `mutable:false` means the pod is
+   immutable. However, for backwards compatibility we need to keep currently mutable fields
+   (container image, resources, ephemeral containers, etc.) mutable. We could make this a tri-state
+   (`Immutable,Default,Mutable`), but that creates a muddy mid-state. Furthermore, a fully immutable
+   pod is impractical, as several fields are necessarily mutable to manage the pod lifecycle (e.g.
+   `schedulingGates`, `tolerations`, `terminationGracePeriodSeconds`).
+2. **Scope creep**: as an extension of the previous point, as soon as we open the door to partial
+   mutability, there are going to be different opinions on what subset of mutations should be
+   allowed. At that point, a custom policy is the preferred approach.
+
+For these reasons, I think depending on existing admission policy and authorization mechanisms is
+preferred.
