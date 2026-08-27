@@ -22,13 +22,12 @@
   - [API Changes](#api-changes)
     - [Dynamic Subresource](#dynamic-subresource)
     - [Limitations](#limitations)
-    - [No SecurityContext escalations](#no-securitycontext-escalations)
     - [Container Status](#container-status)
     - [Allocated Subresource](#allocated-subresource)
   - [Allocation](#allocation)
     - [Image update allocation](#image-update-allocation)
   - [Container Termination](#container-termination)
-  - [Security Considerations](#security-considerations)
+  - [Fail-closed Admission Policy](#fail-closed-admission-policy)
   - [Implementation Details](#implementation-details)
   - [Test Plan](#test-plan)
       - [Unit tests](#unit-tests)
@@ -51,8 +50,11 @@
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
-  - [Optimized Pods](#optimized-pods)
-  - [Ephemeral Containers](#ephemeral-containers)
+  - [Alternatives to Dynamic Containers](#alternatives-to-dynamic-containers)
+    - [Optimized Pods](#optimized-pods)
+    - [Ephemeral Containers](#ephemeral-containers)
+  - [Alternative design details](#alternative-design-details)
+    - [No SecurityContext escalations](#no-securitycontext-escalations)
 <!-- /toc -->
 
 ## Release Signoff Checklist
@@ -242,7 +244,6 @@ These are not inherent requirements for the feature, and can be reevaluated as n
 in the future.
 
   - Only main containers can be added or removed (not init containers).
-  - Container `SecurityContext` cannot escalate permissions. See below.
   - The pod must be in the Running phase before any dynamic container changes can be made. The
     Kubelet will not make any further allocations once the pod has entered a terminated (or
     terminating) phase.
@@ -258,22 +259,6 @@ in the future.
   - Privileged containers cannot be added.
   - HostPorts cannot be used by newly added containers.
 
-#### No SecurityContext escalations
-
-Dynamically added containers are forbidden from escalating the SecurityContext permissions of the
-pod. In other words, they can only add or allow permissions already granted to other containers in
-the pod. More specifically:
-
-- `Capabilities`:
-  - Cannot add a capability that isn't already added by an existing container.
-  - Must drop any capabilities that are dropped by ALL existing containers.
-- `Privileged`: Never allowed.
-- `SELinuxOptions`, `RunAsUSer`, `RunAsGroup`, `SeccompProfile`, `AppArmorProfile`: Can only use values already used by an existing container (or the PodSecurityContext)
-- `WindowsOptions`: N/A (windows not supported)
-- `RunAsNonRoot`, `ReadOnlyRootFilestystem`: Must be set if ALL containers set these.
-- `AllowPrivilegeEscalation`: Must be set to `false` if ALL containers explicitly disable (the implicit default is `true`).
-- `ProcMount`: Can only be set to `Unmasked` if another container already has an unmasked proc mount.
-
 #### Container Status
 
 Containers that have been added but not allocated will generate a `ContainerStatus` with the
@@ -285,14 +270,8 @@ terminated. After termination, the container status will remain until garbage co
 #### Allocated Subresource
 
 A new read-only `/allocated` subresource on pods will surface the allocated pod spec. The allocated
-pod will be fetched directly from the Kubelet on-demand, thus avoiding additional storage overhead
-in the API server.
-
-The Kubelet will serve a new `/allocatedPods` endpoint that functions similarly to `/pods` and
-`/runningPods`, and returns a list of all the allocated pods on the node. An allocated pod is
-represented as a `v1.Pod` object, but the status field is left blank. The subpath
-`/allocatedPods/<POD UID>` can be used to fetch an individual allocated pod, which is what the API
-server will use to serve the allocated pod subresource.
+pod will be fetched directly from the Kubelet's `/allocatedPods` endpoint on-demand, thus avoiding
+additional storage overhead in the API server.
 
 **Justification:** The desired pod spec (stored in the pod resource) can diverge from the allocated
 pod spec (stored locally by the Kubelet) for an arbitrary amount of time. For in-place resize, this
@@ -342,16 +321,26 @@ Once a removed container is terminated, its `ContainerStatus` will be kept in th
 
 Logs from removed containers will be managed by the [existing container garbage collection](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_gc.go).
 
-### Security Considerations
+### Fail-closed Admission Policy
 
-**Admission Configuration:** If custom admission webhooks are configured to intercept only `CREATE`
-operations for Pods or aren't upgraded to intercept the new `dynamic` subresource, then they can be
-bypassed by adding a violating container. Container image is already mutable, so the only new risk
-introduced is granting new permissions. This is mitigated by explicitly forbidding new containers
-from escalating permissions. See [No SecurityContext escalations](#no-securitycontext-escalations).
-Further mitigations will be explored, which is a Beta-blocking criteria.
+**Problem:** Dynamic Containers is breaking a long standing assumption of immutable containers and introducing a
+new API subresource. If custom admission webhooks or policies are configured to intercept only
+`CREATE` operations for Pods or aren't upgraded to intercept the new `dynamic` subresource, then
+they can be bypassed by adding a violating container.
 
-Built-in admission controllers will be updated to handle the new subresource (see [Implementation Details](#implementation-details) below).
+**Solution:** To prevent this, Dynamic Containers will use a new fail-closed admission enforcement
+mechanism. The `dynamic` subresource will only be allowed if all admission controllers and policies
+intercepting pod create/update requests are also configured to intercept the new `dynamic`
+subresource.
+
+In other words, if the request to the `dynamic` subresource would have been handled by an admission
+controller (validating or mutating webhook) or policy (validating or mutating) had it been a create
+or update request on the base `pods` resource, but it is not handled on the `dynamic` resource, then
+the request is automatically rejected.
+
+The scoping of admission handlers is honored in this calculation, so only admission handlers with
+matching `MatchConstraints`, `NamespaceSelector`, or `ObjectSelector` are considered.
+`MatchConditions` are _not_ evaluated as part of this decision.
 
 ### Implementation Details
 
@@ -370,6 +359,10 @@ Built-in admission controllers will be updated to handle the new subresource (se
 **Allocation Manager Admission handling**
   - Treat new containers as an allocation step, similar to resize.
 
+**Fail-closed Admission Enforcement**
+  - Introduce "equivalent expansions" concept to the generic API server, plumbed through the policy dispatcher.
+  - Wire up the equivalent expansions for the `/dynamic` endpoint, handling errors as appropriate.
+
 **Admission Handlers** need to handle updates to the new subresource, including:
   - `PodSecurityAdmission`
   - `PodResizeValidator`
@@ -386,7 +379,8 @@ Built-in admission controllers will be updated to handle the new subresource (se
 - `pkg/kubelet/kuberuntime`: Validate `computePodActions` correctly identifies and gracefully terminates unallocated containers.
 - `pkg/kubelet/status`: Test logic surrounding status batching and the GC retention limit for `ContainerStatuses`.
 - `pkg/api/pod`: Validate admission updates (ensuring unique names, preventing init container modifications, and blocking privileged containers).
-- `pkg/apis/core/validation`: Coverage of validation changes, including all [limitations](#limitations). Extra coverage of the [security context escalation rules](#no-securitycontext-escalations).
+- `pkg/apis/core/validation`: Coverage of validation changes, including all [limitations](#limitations).
+- `staging/src/k8s.io/apiserver/pkg/admission`: Coverage of fail-closed admission policy logic (verifying handler matching, selector filtering, and matchCondition handling).
 - `pkg/kubelet/prober`: Coverage of updated probe manager functionality.
 - `pkg/kubelet/allocation`: Coverage of updated allocation functionality.
 
@@ -394,6 +388,7 @@ Built-in admission controllers will be updated to handle the new subresource (se
 
 - Test routing for the newly proxy-served `/allocated` subresource.
 - Test that the default `edit` role does not allow `/dynamic` mutation.
+- Test fail-closed admission enforcement (rejection when webhooks/policies matching `pods` do not cover `pods/dynamic`, acceptance when updated, and scoping behavior with namespace/object selectors).
 - Test that 1st-party admission handlers are invoked on updates through new subresource (including PodSecurityAdmission, PodResizeValidator, LimitRanger, NodeDeclaredFeatures, and ResourceQuota).
 
 ##### e2e tests
@@ -409,12 +404,12 @@ Built-in admission controllers will be updated to handle the new subresource (se
 - Feature implemented behind a feature flag (`DynamicContainers`).
 - Initial e2e tests completed and enabled.
 - API validation and Kubelet `/allocatedPods` endpoint functional.
+- Implement and validate fail-closed admission policy for legacy admission controllers and webhooks.
 
 #### Beta
 
 - Gather feedback from developers and ecosystem maintainers (e.g., Ray, Slurm).
 - Ecosystem research & outreach for static container assumptions.
-- Decide on (and implement) strategy for legacy admission controllers.
 - Decide on strategy for resolving the Kubelet / Scheduler resize race condition.
 - Decision on whether to add a field to designate pods as dynamic/non-dynamic at creation time.
 
@@ -500,7 +495,7 @@ intact until they naturally terminate.
 
 ###### What specific metrics should inform a rollback?
 
-- Significant increase in API server 5xx errors or latency for `UPDATE /pods` calls.
+- Significant increase in API server 5xx errors or latency for `UPDATE /pods` or `/pods/dynamic` calls.
 - High error rates in Kubelet logs regarding `computePodActions` or allocation failures.
 - Unacceptable increases in etcd disk write latency due to status churn.
 - Third party controller error rates.
@@ -517,7 +512,7 @@ No.
 
 ###### How can an operator determine if the feature is in use by workloads?
 
-Operators can monitor for Pods that have `ContainerStatus` entries with the `Waiting` state and `Unallocated` reason, or monitor API Server audit logs for `UPDATE` events modifying `.spec.containers`.
+Operators can monitor for Pods that have `ContainerStatus` entries with the `Waiting` state and `Unallocated` reason, or monitor API Server audit logs for `UPDATE` events on the `pods/dynamic` subresource modifying `.spec.containers`.
 
 ###### How can someone using this feature know that it is working for their instance?
 
@@ -545,13 +540,13 @@ No, but other services may need to be updated to account for mutable containers.
 
 ###### Will enabling / using this feature result in any new API calls?
 
-Yes. `UPDATE` calls to the `/pods` resource will increase as workloads add and remove containers.
+Yes. `UPDATE` calls to the `pods/dynamic` subresource will increase as workloads add and remove containers.
 Kubelet `PATCH` calls to `/status` will also increase proportionally to container churn. Clients
 querying the `allocated` subresource will trigger the API server to proxy calls to the Kubelet.
 
 ###### Will enabling / using this feature result in introducing new API types?
 
-No new API objects, but a new read-only `allocated` subresource is introduced on the existing `Pod` resource.
+No new API objects, but new `dynamic` and read-only `allocated` subresources are introduced on the existing `Pod` resource.
 
 ###### Will enabling / using this feature result in any new calls to the cloud provider?
 
@@ -603,7 +598,9 @@ third-party controllers, service meshes, and logging tools.
 
 ## Alternatives
 
-### Optimized Pods
+### Alternatives to Dynamic Containers
+
+#### Optimized Pods
 
 The primary problem this proposal aims to address is running a (potentially very short lived)
 workload with minimal latency and overhead. Can we just optimize pod startup and overhead instead?
@@ -615,13 +612,13 @@ model, setting up a database sidecar, or performing a credential exchange. No ma
 minimal pod startup, we cannot optimize away these factors. Solving for this additional
 initialization work would require complicated cross-pod coordination.
 
-### Ephemeral Containers
+#### Ephemeral Containers
 
 Ephemeral containers are already mutable, so maybe we should expand the scope of ephemeral
 containers rather than making regular containers mutable?
 
 The largest gaps are that ephemeral containers are **not restartable or removable**. Additionally,
-they lack supoort for:
+they lack support for:
   - Probes
   - Lifecycle hooks
   - Volume subpath mounts
@@ -630,3 +627,24 @@ they lack supoort for:
 
 In aggregate, these gaps are significant enough that it would be a larger change to close these gaps
 in ephemeral containers than make regular containers mutable.
+
+### Alternative design details
+
+#### No SecurityContext escalations
+
+_This constraint was included in an earlier iteration of the design, but is considered no longer
+necessary with the addition of [fail-closed admission](#fail-closed-admission-policy)._
+
+Dynamically added containers are forbidden from escalating the SecurityContext permissions of the
+pod. In other words, they can only add or allow permissions already granted to other containers in
+the pod. More specifically:
+
+- `Capabilities`:
+  - Cannot add a capability that isn't already added by an existing container.
+  - Must drop any capabilities that are dropped by ALL existing containers.
+- `Privileged`: Never allowed.
+- `SELinuxOptions`, `RunAsUser`, `RunAsGroup`, `SeccompProfile`, `AppArmorProfile`: Can only use values already used by an existing container (or the PodSecurityContext)
+- `WindowsOptions`: N/A (windows not supported)
+- `RunAsNonRoot`, `ReadOnlyRootFilestystem`: Must be set if ALL containers set these.
+- `AllowPrivilegeEscalation`: Must be set to `false` if ALL containers explicitly disable (the implicit default is `true`).
+- `ProcMount`: Can only be set to `Unmasked` if another container already has an unmasked proc mount.
