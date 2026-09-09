@@ -3,7 +3,10 @@ kep-number: 5972
 authors:
   - "@tallclair"
 owning-sig: sig-node
-participating-sigs: []
+participating-sigs:
+  - sig-apps
+  - sig-architecture
+  - sig-auth
 status: implementable
 creation-date: 2026-06-07
 reviewers:
