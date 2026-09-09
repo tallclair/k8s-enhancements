@@ -618,19 +618,20 @@ initialization work would require complicated cross-pod coordination.
 
 #### Ephemeral Containers
 
-Ephemeral containers are already mutable, so maybe we should expand the scope of ephemeral
-containers rather than making regular containers mutable?
+#### Ephemeral Containers
 
-The largest gaps are that ephemeral containers are **not restartable or removable**. Additionally,
-they lack support for:
-  - Probes
-  - Lifecycle hooks
-  - Volume subpath mounts
-  - Container ports
-  - Resources
+Ephemeral containers are already mutable, so a natural question is whether we should expand the scope of `.spec.ephemeralContainers` rather than making `.spec.containers` mutable.
 
-In aggregate, these gaps are significant enough that it would be a larger change to close these gaps
-in ephemeral containers than make regular containers mutable.
+Currently, ephemeral containers are **not restartable or removable**, and API validation forbids probes, lifecycle hooks, volume subpath mounts, container ports, and resources. While relaxing API validation and extending Kubelet container iteration loops (`podutil.AllContainers`) would mechanically enable many of these fields, ephemeral containers have fundamental lifecycle and semantic conflicts with production workloads because they are architected specifically for interactive troubleshooting (`kubectl debug`):
+
+- **Startup ordering (`SyncPod`)**: Ephemeral containers are started *before* `InitContainers` complete so operators can debug pods stuck in initialization. Dynamic workload containers must wait for pod initialization to finish before starting.
+- **Pod termination (`keepCount`)**: Running ephemeral containers are intentionally excluded from the Kubelet's active container count (`keepCount`). When all regular containers exit, the Kubelet terminates the pod sandbox—even if ephemeral containers are still running—so that an attached debug session does not prevent a completed Job pod from terminating. Dynamic containers must keep the pod sandbox alive.
+- **Pod phase and readiness**: Ephemeral container statuses are excluded from `PodPhase` (`Succeeded`/`Failed`) and `ContainersReady`/`PodReady` calculations so attaching a debugger does not alter Job completion or pull a pod out of Service endpoints. Workload containers must govern pod phase and readiness.
+- **QoS calculation exemption**: Resource-free ("best-effort") ephemeral containers are excluded from `ComputePodQOS`, allowing `kubectl debug` to attach a resource-free shell to a `Guaranteed` pod without violating its QoS class. Supporting resources on ephemeral containers would require special-casing QoS evaluation to preserve this exemption for debug containers while enforcing QoS invariants on workload containers.
+- **Namespace targeting (`targetContainerName`)**: Ephemeral containers are designed to attach to another container's namespaces rather than run as standalone pod-level containers.
+
+Beyond Kubelet state-machine conflicts, expanding ephemeral containers conflates distinct operational roles in RBAC:
+- **Role conflation (`pods/ephemeralcontainers` vs. `pods/dynamic`)**: Update permission on `pods/ephemeralcontainers` is granted to human operators and SREs for ad-hoc incident response. Reusing this subresource for dynamic workloads conflates diagnostic debugging permissions with automated workload orchestration and resource management. A dedicated `/dynamic` subresource preserves a clean authorization boundary.
 
 ### Alternative design details
 
